@@ -1,11 +1,13 @@
+require("dotenv").config();
+
 const express = require("express");
 const fs = require("fs");
 const pdfParse = require("pdf-parse/lib/pdf-parse.js");
 const multer = require("multer");
 const cors = require("cors");
-require("dotenv").config();
-
 const { pipeline } = require("@xenova/transformers");
+
+const Groq = require("groq-sdk");
 
 const app = express();
 app.use(express.json());
@@ -13,28 +15,28 @@ app.use(cors());
 
 const upload = multer({ dest: "uploads/" });
 
-// 🔥 Global variables
-let embedder;
-let storedChunks = [];
+// 🔥 Groq Client
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
-/**
- * 🧠 Load AI Model (IMPORTANT)
- */
+// In-memory storage
+let storedChunks = [];
+let embedder;
+
+// 🔥 Load embedding model
 async function loadModel() {
   console.log("Loading AI model...");
   embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
   console.log("Model loaded ✅");
 }
+loadModel();
 
 /**
- * 📤 Upload PDF → Convert to embeddings
+ * 📤 Upload PDF
  */
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
-    if (!embedder) {
-      return res.json({ message: "Model still loading, try again..." });
-    }
-
     const filePath = req.file.path;
 
     const dataBuffer = fs.readFileSync(filePath);
@@ -44,8 +46,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     console.log("PDF length:", text.length);
 
-    // Split text into chunks
-    const chunks = text.match(/(.|[\r\n]){1,500}/g) || [];
+    // Split into chunks
+    const chunks = text.match(/(.|[\r\n]){1,500}/g);
 
     storedChunks = [];
 
@@ -64,7 +66,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     console.log("Stored chunks:", storedChunks.length);
 
     res.json({
-      message: "File uploaded & processed with semantic embeddings 🚀",
+      message: "File uploaded & embeddings created 🚀",
       chunks: storedChunks.length,
     });
 
@@ -75,80 +77,108 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 });
 
 /**
- * 🔍 Cosine Similarity
+ * ❓ Ask Question (REAL RAG with Groq)
  */
-function cosineSimilarity(a, b) {
-  return a.reduce((sum, val, i) => sum + val * b[i], 0);
-}
 
-/**
- * ❓ Ask Question (SEMANTIC RAG)
- */
+
 app.post("/ask", async (req, res) => {
   try {
-    const { question } = req.body;
+    const { question, history = [] } = req.body;
 
     if (!question) {
-      return res.status(400).json({ error: "Question is required" });
-    }
-
-    if (!embedder) {
-      return res.json({ answer: "Model still loading..." });
+      return res.status(400).send("Question is required");
     }
 
     if (storedChunks.length === 0) {
-      return res.json({ answer: "Please upload a document first." });
+      return res.send("Upload PDF first");
     }
 
-    // Convert question to embedding
+    // 🔹 Embed question
     const qEmbedding = await embedder(question, {
       pooling: "mean",
       normalize: true,
     });
 
-    // Compare with stored chunks
-    const results = storedChunks.map((chunk) => ({
-      text: chunk.text,
-      score: cosineSimilarity(qEmbedding.data, chunk.embedding),
-    }));
+    // 🔹 Cosine similarity
+    function cosineSimilarity(a, b) {
+      let dot = 0, normA = 0, normB = 0;
 
-    // Sort by similarity
-    results.sort((a, b) => b.score - a.score);
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+      }
 
-    // Get top 3 results
-    const answer = results
+      return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+
+    // 🔹 Get top chunks
+    const topChunks = storedChunks
+      .map((c) => ({
+        text: c.text,
+        score: cosineSimilarity(qEmbedding.data, c.embedding),
+      }))
+      .sort((a, b) => b.score - a.score)
       .slice(0, 3)
-      .map((r) => r.text)
+      .map((c) => c.text)
       .join("\n");
 
-    res.json({ answer });
+    // 🔥 Prepare messages
+    const messages = [
+      {
+        role: "system",
+        content:
+          "Answer ONLY from context. If not found, say 'Not found in document'.",
+      },
+      ...history,
+      {
+        role: "user",
+        content: `Context:\n${topChunks}\n\nQuestion: ${question}`,
+      },
+    ];
 
+    // 🔥 IMPORTANT: streaming headers
+   res.setHeader("Content-Type", "text/plain");
+  res.setHeader("Transfer-Encoding", "chunked");
+
+    const stream = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      messages,
+      stream: true,
+    });
+
+    // 🔥 Send chunks live
+    for await (const chunk of stream) {
+    const content = chunk.choices[0]?.delta?.content;
+    if (content) {
+      res.write(content); // ✅ ONLY THIS
+    }
+  }
+
+    res.end();
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error("FULL ERROR:", err);
+    res.status(500).send("Server error");
   }
 });
-
 /**
- * 🧹 Clear Documents
+ * 🧹 Clear
  */
 app.delete("/clear", (req, res) => {
   storedChunks = [];
-  res.json({ message: "Documents cleared" });
+  res.json({ message: "Cleared successfully" });
 });
 
 /**
- * 🏠 Root
+ * Root
  */
 app.get("/", (req, res) => {
-  res.send("Semantic RAG Chatbot API running 🚀");
+  res.send("RAG Chatbot with Groq is running 🚀");
 });
 
 /**
- * 🚀 Start Server ONLY after model loads
+ * Start server
  */
-loadModel().then(() => {
-  app.listen(3000, () => {
-    console.log("Server running on http://localhost:3000");
-  });
+app.listen(3000, () => {
+  console.log("Server running on http://localhost:3000");
 });
