@@ -9,7 +9,8 @@ function App() {
   const [question, setQuestion] = useState("");
   const [file, setFile] = useState(null);
 
-  const activeChat = chats.find(c => c.id === activeChatId);
+  const activeChat =
+    chats.find(c => c.id === activeChatId) || { messages: [] };
 
   // 🆕 New Chat
   const createNewChat = () => {
@@ -55,25 +56,42 @@ function App() {
     }
   };
 
-  // 💬 Ask Question (Streaming)
+  // 💬 Ask Question
   const askQuestion = async () => {
     if (!question.trim()) return;
 
-    const updatedChats = chats.map(chat => {
-      if (chat.id === activeChatId) {
-        return {
-          ...chat,
-          messages: [
-            ...chat.messages,
-            { type: "user", text: question },
-            { type: "bot", text: "" }
-          ]
-        };
-      }
-      return chat;
-    });
+    const currentQuestion = question;
+    const chatId = activeChatId;
 
-    setChats(updatedChats);
+    // UI update
+    setChats(prev =>
+      prev.map(chat => {
+        if (chat.id === chatId) {
+          let updatedTitle = chat.title;
+
+          if (chat.messages.length === 0) {
+            const clean = currentQuestion.trim();
+            updatedTitle =
+              clean.length > 30
+                ? clean.slice(0, 30) + "..."
+                : clean;
+          }
+
+          return {
+            ...chat,
+            title: updatedTitle,
+            messages: [
+              ...chat.messages,
+              { type: "user", text: currentQuestion },
+              { type: "bot", text: "" }
+            ]
+          };
+        }
+        return chat;
+      })
+    );
+
+    setQuestion("");
 
     try {
       const response = await fetch("http://localhost:3000/ask", {
@@ -82,7 +100,7 @@ function App() {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          question,
+          question: currentQuestion,
           history: activeChat.messages.map(m => ({
             role: m.type === "user" ? "user" : "assistant",
             content: m.text
@@ -93,33 +111,54 @@ function App() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
 
-      let done = false;
-      let fullText = "";
+      let streamedText = "";
+      let displayText = "";
+      let typingInterval = null;
 
-      while (!done) {
-        const { value, done: doneReading } = await reader.read();
-        done = doneReading;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
 
-        const chunk = decoder.decode(value);
-        fullText += chunk;
+        const chunk = decoder.decode(value || new Uint8Array());
+        streamedText += chunk;
 
-        setChats(prev =>
-          prev.map(chat => {
-            if (chat.id === activeChatId) {
-              const msgs = [...chat.messages];
-              msgs[msgs.length - 1].text = fullText;
-              return { ...chat, messages: msgs };
+        if (!typingInterval) {
+          typingInterval = setInterval(() => {
+            if (displayText.length < streamedText.length) {
+              displayText += streamedText[displayText.length];
+
+              setChats(prev =>
+                prev.map(chat => {
+                  if (chat.id === chatId) {
+                    const msgs = [...chat.messages];
+                    msgs[msgs.length - 1].text = displayText;
+                    return { ...chat, messages: msgs };
+                  }
+                  return chat;
+                })
+              );
             }
-            return chat;
-          })
-        );
+          }, 15);
+        }
       }
+
+      if (typingInterval) clearInterval(typingInterval);
+
+      // final text fix
+      setChats(prev =>
+        prev.map(chat => {
+          if (chat.id === chatId) {
+            const msgs = [...chat.messages];
+            msgs[msgs.length - 1].text = streamedText;
+            return { ...chat, messages: msgs };
+          }
+          return chat;
+        })
+      );
 
     } catch (err) {
       console.error(err);
     }
-
-    setQuestion("");
   };
 
   return (
@@ -127,6 +166,15 @@ function App() {
 
       {/* Sidebar */}
       <div style={styles.sidebar}>
+
+        {/* 🔥 Branding */}
+        <div style={styles.brand}>
+          🤖 DocuMind AI
+          <div style={styles.tagline}>
+            Chat with your documents
+          </div>
+        </div>
+
         <button style={styles.newChatBtn} onClick={createNewChat}>
           + New Chat
         </button>
@@ -149,8 +197,10 @@ function App() {
       {/* Main */}
       <div style={styles.main}>
 
-        {/* 🔥 Header Controls */}
+        {/* Header */}
         <div style={styles.header}>
+          <div style={styles.headerTitle}>DocuMind AI</div>
+
           <input
             type="file"
             onChange={(e) => setFile(e.target.files[0])}
@@ -196,8 +246,9 @@ function App() {
             value={question}
             onChange={e => setQuestion(e.target.value)}
             onKeyDown={e => e.key === "Enter" && askQuestion()}
-            placeholder="Send a message..."
+            placeholder="Ask something about your document..."
           />
+
           <button style={styles.sendBtn} onClick={askQuestion}>
             Send
           </button>
@@ -217,9 +268,24 @@ const styles = {
   },
 
   sidebar: {
-    width: "250px",
+    width: "260px",
     background: "#202123",
     padding: "10px"
+  },
+
+  brand: {
+    fontSize: "18px",
+    fontWeight: "bold",
+    textAlign: "center",
+    marginBottom: "10px",
+    borderBottom: "1px solid #444",
+    paddingBottom: "10px"
+  },
+
+  tagline: {
+    fontSize: "12px",
+    color: "#aaa",
+    marginTop: "4px"
   },
 
   newChatBtn: {
@@ -229,7 +295,8 @@ const styles = {
     color: "#fff",
     borderRadius: "6px",
     cursor: "pointer",
-    marginBottom: "10px"
+    marginBottom: "10px",
+    width: "100%"
   },
 
   chatItem: {
@@ -249,7 +316,13 @@ const styles = {
     display: "flex",
     gap: "10px",
     padding: "10px",
-    borderBottom: "1px solid #555"
+    borderBottom: "1px solid #555",
+    alignItems: "center"
+  },
+
+  headerTitle: {
+    fontWeight: "bold",
+    marginRight: "auto"
   },
 
   uploadBtn: {
