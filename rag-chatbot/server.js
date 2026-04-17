@@ -5,8 +5,7 @@ const multer = require("multer");
 const cors = require("cors");
 require("dotenv").config();
 
-
-const OpenAI = require("openai");
+const { pipeline } = require("@xenova/transformers");
 
 const app = express();
 app.use(express.json());
@@ -14,37 +13,76 @@ app.use(cors());
 
 const upload = multer({ dest: "uploads/" });
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// In-memory document store
-let documents = [];
+// 🔥 Global variables
+let embedder;
+let storedChunks = [];
 
 /**
- * 📤 Upload PDF
+ * 🧠 Load AI Model (IMPORTANT)
+ */
+async function loadModel() {
+  console.log("Loading AI model...");
+  embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+  console.log("Model loaded ✅");
+}
+
+/**
+ * 📤 Upload PDF → Convert to embeddings
  */
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
+    if (!embedder) {
+      return res.json({ message: "Model still loading, try again..." });
+    }
+
     const filePath = req.file.path;
 
     const dataBuffer = fs.readFileSync(filePath);
     const pdfData = await pdfParse(dataBuffer);
 
-    documents.push(pdfData.text);
+    const text = pdfData.text;
+
+    console.log("PDF length:", text.length);
+
+    // Split text into chunks
+    const chunks = text.match(/(.|[\r\n]){1,500}/g) || [];
+
+    storedChunks = [];
+
+    for (let chunk of chunks) {
+      const embedding = await embedder(chunk, {
+        pooling: "mean",
+        normalize: true,
+      });
+
+      storedChunks.push({
+        text: chunk,
+        embedding: embedding.data,
+      });
+    }
+
+    console.log("Stored chunks:", storedChunks.length);
 
     res.json({
-      message: "File uploaded & processed successfully",
-      length: pdfData.text.length,
+      message: "File uploaded & processed with semantic embeddings 🚀",
+      chunks: storedChunks.length,
     });
+
   } catch (err) {
-  console.error(err); // ADD THIS
-  res.status(500).json({ error: err.message });
-}
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /**
- * ❓ Ask Question (RAG)
+ * 🔍 Cosine Similarity
+ */
+function cosineSimilarity(a, b) {
+  return a.reduce((sum, val, i) => sum + val * b[i], 0);
+}
+
+/**
+ * ❓ Ask Question (SEMANTIC RAG)
  */
 app.post("/ask", async (req, res) => {
   try {
@@ -54,48 +92,63 @@ app.post("/ask", async (req, res) => {
       return res.status(400).json({ error: "Question is required" });
     }
 
-    const context = documents.join("\n");
-
-    // Simple keyword-based search
-    const sentences = context.split("."); // break into sentences
-
-    const keywords = question.toLowerCase().split(" ");
-
-    const matched = sentences.filter((sentence) => {
-      return keywords.some((word) =>
-        sentence.toLowerCase().includes(word)
-      );
-    });
-
-    if (matched.length === 0) {
-      return res.json({
-        answer: "No relevant information found in document.",
-      });
+    if (!embedder) {
+      return res.json({ answer: "Model still loading..." });
     }
 
-    // Return top 3 matching lines
-    const answer = matched.slice(0, 3).join(". ");
+    if (storedChunks.length === 0) {
+      return res.json({ answer: "Please upload a document first." });
+    }
+
+    // Convert question to embedding
+    const qEmbedding = await embedder(question, {
+      pooling: "mean",
+      normalize: true,
+    });
+
+    // Compare with stored chunks
+    const results = storedChunks.map((chunk) => ({
+      text: chunk.text,
+      score: cosineSimilarity(qEmbedding.data, chunk.embedding),
+    }));
+
+    // Sort by similarity
+    results.sort((a, b) => b.score - a.score);
+
+    // Get top 3 results
+    const answer = results
+      .slice(0, 3)
+      .map((r) => r.text)
+      .join("\n");
 
     res.json({ answer });
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
+
 /**
- * 🧹 Clear Docs (optional)
+ * 🧹 Clear Documents
  */
 app.delete("/clear", (req, res) => {
-  documents = [];
+  storedChunks = [];
   res.json({ message: "Documents cleared" });
 });
 
 /**
- * 🚀 Start Server
+ * 🏠 Root
  */
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
-});
 app.get("/", (req, res) => {
-  res.send("RAG Chatbot API is running 🚀");
+  res.send("Semantic RAG Chatbot API running 🚀");
+});
+
+/**
+ * 🚀 Start Server ONLY after model loads
+ */
+loadModel().then(() => {
+  app.listen(3000, () => {
+    console.log("Server running on http://localhost:3000");
+  });
 });
